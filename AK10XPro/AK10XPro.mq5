@@ -42,6 +42,30 @@ struct SwingPoint {
    bool isHigh;
 };
 
+struct ZZPoint {
+   double price;
+   datetime time;
+   bool isHigh;
+   string label; // "HH", "LH", "HL", "LL"
+};
+
+struct BreakoutState {
+   bool isValid;
+   string levelType;      // "VRZ High" or "VRZ Low"
+   double levelPrice;     // VRZ price
+   datetime time;         // Breakout candle time
+   double sl;             // Stop Loss price
+   double tp;             // Take Profit price
+   ENUM_SETUP_TYPE setup; // BOL, BOS, BOFS, BOFL
+   string reaction;       // "Continuation", "Immediate Reversal", "Direct Breakout"
+   string status;         // "N/A", "Pending Order", "Running Order", "Closed"
+   string grade;          // "A++" or "A+++"
+   bool riskFreeDone;
+   double currentLot;
+   datetime fillTime;
+   ulong positionTicket;
+};
+
 //--- Inputs
 input group "=== Major Swing Structure (HUD Only) ==="
 input int             Major_SwingLeft   = 5;                // Left candles for Major Swing
@@ -59,12 +83,13 @@ input int             HTF_SwingRight    = 2;                // Right candles for
 input double          HighProbVRZPips   = 10.0;             // Max distance in pips for overlapping VRZs
 
 input group "=== Risk & Trade Management ==="
-input double          BaseLotSize       = 1.0;              // Lot size per position (Total = 2 * BaseLotSize)
+input double          BaseLotSize       = 0.02;             // Lot size per position
 input double          RiskPercent       = 0.0;              // Dynamic risk % (if > 0, overrides BaseLotSize)
 input double          MinRiskReward     = 3.0;              // Minimum Risk to Reward Ratio
-input int             StopLossBuffer    = 2;                // SL buffer in pips (outside breakout candle)
+input int             StopLossBuffer    = 30;               // SL buffer in pips (outside breakout candle)
 input int             Slippage          = 3;                // Allowed slippage in points
 input ulong           MagicNumber       = 101010;           // Expert Advisor Magic Number
+input bool            EnableRiskFree    = true;             // Enable Risk-Free Management (50% partial close)
 
 input group "=== News Filter ==="
 input bool            UseNewsFilter     = true;             // Enable Economic Calendar filter
@@ -83,6 +108,8 @@ input color           ColorEagleLow     = clrDarkRed;       // Eagle VRZ Low lin
 input color           ColorZigzag       = clrLightSeaGreen; // Zigzag line color
 input color           ColorHUD_Bg       = C'20,20,20';      // HUD Background color
 input color           ColorHUD_Text     = clrWhite;         // HUD Text color
+input int             MaxMitigatedDraw  = 10;               // Max mitigated VRZ lines to draw
+
 
 //--- Global Variables
 CTrade         trade;
@@ -105,10 +132,24 @@ double         minor_SwingHighPrice = 0.0;
 double         minor_SwingLowPrice  = 0.0;
 
 bool           AutoTradingEnabled   = false;
+bool           HUD_Minimized        = false;
 datetime       lastBarTime          = 0;
 string         hudObjects[];
 
+//--- Breakout tracking variables
+BreakoutState  currentBreakout;
+double         lastTickPrice        = 0.0;
+
 void UpdateCountdown();
+void ProcessBreakoutStateMachine();
+void DetectBreakoutFromHistory();
+ENUM_TREND GetHTFTrend();
+
+//--- Forward declarations for virgin helper functions
+int GetHistoricalSwings(ENUM_TIMEFRAMES tf, int leftBars, int rightBars, SwingPoint &highs[], SwingPoint &lows[], int maxCount);
+datetime GetExactSwingTimeTTF(datetime htfTime, double price, bool isHigh);
+datetime GetBreakoutTimeTTF(double price, datetime swingTime, bool isHigh);
+void SortSwingPoints(SwingPoint &arr[], bool ascending);
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -145,6 +186,9 @@ int OnInit()
    EventSetTimer(1); 
    
    // Initial processing
+   UpdateVRZones();
+   UpdateTrends();
+   DetectBreakoutFromHistory();
    ProcessTradingLogic();
    
    ChartRedraw(0);
@@ -169,8 +213,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
-   // Manage existing active positions and check for break-even trail on Lot 2
-   ManageActivePositions();
+   // Run logical thinker state machine on every tick
+   ProcessBreakoutStateMachine();
    
    // Check if a new bar has opened on the Trading Timeframe
    datetime currentBarTime = iTime(_Symbol, TradingPeriod, 0);
@@ -180,7 +224,11 @@ void OnTick()
       ProcessTradingLogic();
      }
      
-   if(ShowHUD) UpdateCountdown();
+   if(ShowHUD) 
+     {
+      UpdateHUD();
+      UpdateCountdown();
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -188,8 +236,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
   {
-   // Update HUD elements and manage pending orders
-   ManagePendingOrders();
+   ProcessBreakoutStateMachine();
    ScanClosedPositions();
    if(ShowHUD) 
      {
@@ -213,6 +260,11 @@ void OnChartEvent(const int id,
          AutoTradingEnabled = !AutoTradingEnabled;
          UpdateHUD();
         }
+      else if(sparam == "AK10X_HUD_Btn_MinMax")
+        {
+         HUD_Minimized = !HUD_Minimized;
+         UpdateHUD();
+        }
      }
   }
 
@@ -221,23 +273,55 @@ void OnChartEvent(const int id,
 //+------------------------------------------------------------------+
 void ProcessTradingLogic()
   {
-   // 1. Update Swing Points & VRZs
+   // 1. Process breakout state machine
+   ProcessBreakoutStateMachine();
+   
+   // 2. Update Swing Points & VRZs (updates levels for the next candle)
    UpdateVRZones();
    
-   // 2. Update Trend States
+   // 3. Update Trend States
    UpdateTrends();
    
-   // 3. Draw Zigzag & Swing Labels
+   // 4. Draw Zigzag & Swing Labels
    DrawZigzagAndLabels();
-   
-   // 4. Process Setup Detection (Automatic limit orders)
-   if(AutoTradingEnabled)
-     {
-      DetectSetupsAndExecute();
-     }
    
    // 5. Update UI
    if(ShowHUD) UpdateHUD();
+  }
+
+//+------------------------------------------------------------------+
+//| Get Latest Bid Price (Force Tick Update)                         |
+//+------------------------------------------------------------------+
+double GetLatestBid()
+  {
+   double bid = iClose(_Symbol, TradingPeriod, 0);
+   if(bid > 0) return bid;
+   
+   MqlTick tick;
+   if(SymbolInfoTick(_Symbol, tick))
+     {
+      if(tick.bid > 0) return tick.bid;
+     }
+   return SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  }
+
+//+------------------------------------------------------------------+
+//| Get Latest Ask Price (Force Tick Update)                         |
+//+------------------------------------------------------------------+
+double GetLatestAsk()
+  {
+   double bid = GetLatestBid();
+   double ask = 0.0;
+   MqlTick tick;
+   if(SymbolInfoTick(_Symbol, tick) && tick.ask > 0) 
+     {
+      if(MathAbs(tick.bid - bid) < SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10)
+         return tick.ask;
+     }
+   int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   ask = bid + (spread * point);
+   return ask;
   }
 
 //+------------------------------------------------------------------+
@@ -247,6 +331,29 @@ double GetPipSize()
   {
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   string sym = _Symbol;
+   StringToUpper(sym);
+   
+   // Cryptocurrencies (BTC, ETH, LTC, SOL, etc.)
+   if(StringFind(sym, "BTC") >= 0 || StringFind(sym, "ETH") >= 0 || StringFind(sym, "LTC") >= 0 || StringFind(sym, "XBT") >= 0 || StringFind(sym, "SOL") >= 0)
+     {
+      return 1.0;
+     }
+     
+   // Gold (XAUUSD, GOLD, etc.)
+   if(StringFind(sym, "XAU") >= 0 || StringFind(sym, "GOLD") >= 0)
+     {
+      return 0.1;
+     }
+     
+   // Silver (XAGUSD, SILVER, etc.)
+   if(StringFind(sym, "XAG") >= 0 || StringFind(sym, "SILVER") >= 0)
+     {
+      return 0.01;
+     }
+     
+   // Forex currency pairs
    if(digits == 3 || digits == 5) return point * 10.0;
    return point;
   }
@@ -256,24 +363,7 @@ double GetPipSize()
 //+------------------------------------------------------------------+
 double GetPipDivisor()
   {
-   string sym = _Symbol;
-   int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
-   
-   if(StringFind(sym, "BTC") >= 0 || StringFind(sym, "ETH") >= 0 || (StringFind(sym, "USD") == -1 && digits <= 2))
-     {
-      return 1.0;
-     }
-   if(digits == 0) return 1.0;
-   if(digits == 1) return pt;
-   if(digits == 2) 
-     {
-      if(StringFind(sym, "BTC") >= 0 || StringFind(sym, "ETH") >= 0 || StringFind(sym, "XBT") >= 0)
-         return 1.0;
-      return pt * 10.0;
-     }
-   if(digits == 3 || digits == 5) return pt * 10.0;
-   return pt;
+   return GetPipSize();
   }
 
 //+------------------------------------------------------------------+
@@ -281,65 +371,81 @@ double GetPipDivisor()
 //+------------------------------------------------------------------+
 double GetRecentVirginHigh(ENUM_TIMEFRAMES tf, int leftBars, int rightBars)
   {
+   SwingPoint highs[], lows[];
+   GetHistoricalSwings(tf, leftBars, rightBars, highs, lows, 250);
+   
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   int copied = CopyRates(_Symbol, tf, 1, 3000, rates);
-   if(copied <= 0) return 0.0;
-   
-   for(int i = rightBars; i < copied - leftBars; i++)
+   double lastClose = GetLatestBid();
+   if(CopyRates(_Symbol, TradingPeriod, 1, 1, rates) > 0)
      {
-      double h = rates[i].high;
-      bool isHigh = true;
-      for(int l = 1; l <= leftBars; l++) {
-         if(rates[i+l].high >= h) { isHigh = false; break; }
-      }
-      if(!isHigh) continue;
-      for(int r = 1; r <= rightBars; r++) {
-         if(rates[i-r].high >= h) { isHigh = false; break; }
-      }
-      if(!isHigh) continue;
-      
-      // Check if Virgin (no subsequent bar went higher)
-      bool isVirgin = true;
-      for(int j = i - 1; j >= 0; j--) {
-         if(rates[j].high > h) { isVirgin = false; break; }
-      }
-      if(isVirgin) return h;
+      lastClose = rates[0].close;
      }
-   return 0.0;
+   
+   SwingPoint virginHighs[];
+   int vHCount = 0;
+   
+   for(int i = 0; i < ArraySize(highs); i++)
+     {
+      double price = highs[i].price;
+      datetime swingTime = GetExactSwingTimeTTF(highs[i].time, price, true);
+      datetime breakoutTime = GetBreakoutTimeTTF(price, swingTime, true);
+      bool isVirgin = (breakoutTime == 0);
+      
+      if(isVirgin && lastClose <= price)
+        {
+         ArrayResize(virginHighs, vHCount + 1);
+         virginHighs[vHCount] = highs[i];
+         virginHighs[vHCount].time = swingTime;
+         vHCount++;
+        }
+     }
+     
+   if(vHCount == 0) return 0.0;
+   
+   SortSwingPoints(virginHighs, true); // Ascending order (closest first)
+   return virginHighs[0].price;
   }
 
 //+------------------------------------------------------------------+
-//| Find the most recent Virgin Low on a given timeframe             |
+//| Find the closest Virgin Low below current price                  |
 //+------------------------------------------------------------------+
 double GetRecentVirginLow(ENUM_TIMEFRAMES tf, int leftBars, int rightBars)
   {
+   SwingPoint highs[], lows[];
+   GetHistoricalSwings(tf, leftBars, rightBars, highs, lows, 250);
+   
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   int copied = CopyRates(_Symbol, tf, 1, 3000, rates);
-   if(copied <= 0) return 0.0;
-   
-   for(int i = rightBars; i < copied - leftBars; i++)
+   double lastClose = GetLatestBid();
+   if(CopyRates(_Symbol, TradingPeriod, 1, 1, rates) > 0)
      {
-      double l = rates[i].low;
-      bool isLow = true;
-      for(int l_bar = 1; l_bar <= leftBars; l_bar++) {
-         if(rates[i+l_bar].low <= l) { isLow = false; break; }
-      }
-      if(!isLow) continue;
-      for(int r = 1; r <= rightBars; r++) {
-         if(rates[i-r].low <= l) { isLow = false; break; }
-      }
-      if(!isLow) continue;
-      
-      // Check if Virgin (no subsequent bar went lower)
-      bool isVirgin = true;
-      for(int j = i - 1; j >= 0; j--) {
-         if(rates[j].low < l) { isVirgin = false; break; }
-      }
-      if(isVirgin) return l;
+      lastClose = rates[0].close;
      }
-   return 0.0;
+   
+   SwingPoint virginLows[];
+   int vLCount = 0;
+   
+   for(int i = 0; i < ArraySize(lows); i++)
+     {
+      double price = lows[i].price;
+      datetime swingTime = GetExactSwingTimeTTF(lows[i].time, price, false);
+      datetime breakoutTime = GetBreakoutTimeTTF(price, swingTime, false);
+      bool isVirgin = (breakoutTime == 0);
+      
+      if(isVirgin && lastClose >= price)
+        {
+         ArrayResize(virginLows, vLCount + 1);
+         virginLows[vLCount] = lows[i];
+         virginLows[vLCount].time = swingTime;
+         vLCount++;
+        }
+     }
+     
+   if(vLCount == 0) return 0.0;
+   
+   SortSwingPoints(virginLows, false); // Descending order (closest first)
+   return virginLows[0].price;
   }
 
 //+------------------------------------------------------------------+
@@ -412,7 +518,8 @@ datetime GetBreakoutTimeTTF(double price, datetime swingTime, bool isHigh)
   {
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
-   int copied = CopyRates(_Symbol, TradingPeriod, 0, 1000, rates);
+   // Copy starting from index 1 to ignore the active forming candle
+   int copied = CopyRates(_Symbol, TradingPeriod, 1, 1000, rates);
    if(copied <= 0) return TimeCurrent();
    
    int swingIdx = -1;
@@ -561,23 +668,25 @@ void CreateVRZLine(string name, double price, datetime startTime, datetime endTi
       labelPrice = isHigh ? (price + offset) : (price - offset);
      }
    
-   if(ObjectCreate(0, labelObjName, OBJ_TEXT, 0, labelTime, labelPrice))
-     {
-      ObjectSetString(0, labelObjName, OBJPROP_TEXT, labelText);
-      ObjectSetString(0, labelObjName, OBJPROP_FONT, "Arial");
-      ObjectSetInteger(0, labelObjName, OBJPROP_FONTSIZE, 7);
-      ObjectSetInteger(0, labelObjName, OBJPROP_COLOR, clr);
-      ObjectSetInteger(0, labelObjName, OBJPROP_ANCHOR, anchorPoint);
-      ObjectSetInteger(0, labelObjName, OBJPROP_SELECTABLE, false);
-     }
-   else
-     {
-      ObjectSetInteger(0, labelObjName, OBJPROP_TIME, 0, labelTime);
-      ObjectSetDouble(0, labelObjName, OBJPROP_PRICE, 0, labelPrice);
-      ObjectSetString(0, labelObjName, OBJPROP_TEXT, labelText);
-      ObjectSetInteger(0, labelObjName, OBJPROP_COLOR, clr);
-      ObjectSetInteger(0, labelObjName, OBJPROP_ANCHOR, anchorPoint);
-     }
+    if(ObjectCreate(0, labelObjName, OBJ_TEXT, 0, labelTime, labelPrice))
+      {
+       ObjectSetString(0, labelObjName, OBJPROP_TEXT, labelText);
+       ObjectSetString(0, labelObjName, OBJPROP_FONT, "Arial");
+       ObjectSetInteger(0, labelObjName, OBJPROP_FONTSIZE, 7);
+       ObjectSetInteger(0, labelObjName, OBJPROP_COLOR, clr);
+       ObjectSetInteger(0, labelObjName, OBJPROP_ANCHOR, anchorPoint);
+       ObjectSetInteger(0, labelObjName, OBJPROP_SELECTABLE, false);
+       ObjectSetInteger(0, labelObjName, OBJPROP_BACK, true);
+      }
+    else
+      {
+       ObjectSetInteger(0, labelObjName, OBJPROP_TIME, 0, labelTime);
+       ObjectSetDouble(0, labelObjName, OBJPROP_PRICE, 0, labelPrice);
+       ObjectSetString(0, labelObjName, OBJPROP_TEXT, labelText);
+       ObjectSetInteger(0, labelObjName, OBJPROP_COLOR, clr);
+       ObjectSetInteger(0, labelObjName, OBJPROP_ANCHOR, anchorPoint);
+       ObjectSetInteger(0, labelObjName, OBJPROP_BACK, true);
+      }
   }
 
 // Price labels disabled
@@ -689,51 +798,51 @@ void DrawVRZLines()
       CreateVRZLine("AK10X_VRZ_HTF_H_V_" + (string)i, price, swingTime, endTime, clr, STYLE_SOLID, 1, label, false, true);
      }
      
-   // Draw most recent 3 mitigated highs (filter duplicate labels near same price)
-   int mHighsToDraw = MathMin(3, mHCount);
-   double drawnHighPrices[];
-   int drawnHighCount = 0;
-   
-   for(int i = 0; i < mHighsToDraw; i++)
-     {
-      double price = mitigatedHighs[i].price;
-      datetime swingTime = mitigatedHighs[i].time;
-      datetime endTime = GetBreakoutTimeTTF(price, swingTime, true);
-      
-      // Verify Eagle overlap
-      bool isEagle = false;
-      for(int k = 0; k < ArraySize(highsHHTF); k++)
-        {
-         if(MathAbs(highsHHTF[k].price - price) / pip <= HighProbVRZPips)
-           {
-            isEagle = true;
-            break;
-           }
-        }
-      
-      color clr = clrRoyalBlue;
-      string label = isEagle ? "Eagle VRZ High" : "VRZ High";
-      
-      // Filter duplicate labels near same price (within 3 pips)
-      bool skipLabel = false;
-      for(int j = 0; j < drawnHighCount; j++)
-        {
-         if(MathAbs(drawnHighPrices[j] - price) / pip <= 3.0)
-           {
-            skipLabel = true;
-            break;
-           }
-        }
-      
-      if(!skipLabel)
-        {
-         ArrayResize(drawnHighPrices, drawnHighCount + 1);
-         drawnHighPrices[drawnHighCount] = price;
-         drawnHighCount++;
-        }
-      
-      CreateVRZLine("AK10X_VRZ_HTF_H_M_" + (string)i, price, swingTime, endTime, clr, STYLE_DOT, 1, label, true, true, skipLabel);
-     }
+    // Draw most recent mitigated highs (filter duplicate labels near same price)
+    int mHighsToDraw = MathMin(MaxMitigatedDraw, mHCount);
+    double drawnHighPrices[];
+    int drawnHighCount = 0;
+    
+    for(int i = 0; i < mHighsToDraw; i++)
+      {
+       double price = mitigatedHighs[i].price;
+       datetime swingTime = mitigatedHighs[i].time;
+       datetime endTime = GetBreakoutTimeTTF(price, swingTime, true);
+       
+       // Verify Eagle overlap
+       bool isEagle = false;
+       for(int k = 0; k < ArraySize(highsHHTF); k++)
+         {
+          if(MathAbs(highsHHTF[k].price - price) / pip <= HighProbVRZPips)
+            {
+             isEagle = true;
+             break;
+            }
+         }
+       
+       color clr = isEagle ? ColorEagleHigh : ColorVRZ_Active;
+       string label = isEagle ? "Eagle VRZ High" : "VRZ High";
+       
+       // Filter duplicate labels near same price (within 3 pips)
+       bool skipLabel = false;
+       for(int j = 0; j < drawnHighCount; j++)
+         {
+          if(MathAbs(drawnHighPrices[j] - price) / pip <= 3.0)
+            {
+             skipLabel = true;
+             break;
+            }
+         }
+       
+       if(!skipLabel)
+         {
+          ArrayResize(drawnHighPrices, drawnHighCount + 1);
+          drawnHighPrices[drawnHighCount] = price;
+          drawnHighCount++;
+         }
+       
+       CreateVRZLine("AK10X_VRZ_HTF_H_M_" + (string)i, price, swingTime, endTime, clr, STYLE_DOT, 1, label, true, true, skipLabel);
+      }
      
    // Process Lows
    SwingPoint virginLows[];
@@ -792,51 +901,51 @@ void DrawVRZLines()
       CreateVRZLine("AK10X_VRZ_HTF_L_V_" + (string)i, price, swingTime, endTime, clr, STYLE_SOLID, 1, label, false, false);
      }
      
-   // Draw most recent 3 mitigated lows (filter duplicate labels near same price)
-   int mLowsToDraw = MathMin(3, mLCount);
-   double drawnLowPrices[];
-   int drawnLowCount = 0;
-   
-   for(int i = 0; i < mLowsToDraw; i++)
-     {
-      double price = mitigatedLows[i].price;
-      datetime swingTime = mitigatedLows[i].time;
-      datetime endTime = GetBreakoutTimeTTF(price, swingTime, false);
-      
-      // Verify Eagle overlap
-      bool isEagle = false;
-      for(int k = 0; k < ArraySize(lowsHHTF); k++)
-        {
-         if(MathAbs(lowsHHTF[k].price - price) / pip <= HighProbVRZPips)
-           {
-            isEagle = true;
-            break;
-           }
-        }
-      
-      color clr = clrCrimson;
-      string label = isEagle ? "Eagle VRZ Low" : "VRZ Low";
-      
-      // Filter duplicate labels near same price (within 3 pips)
-      bool skipLabel = false;
-      for(int j = 0; j < drawnLowCount; j++)
-        {
-         if(MathAbs(drawnLowPrices[j] - price) / pip <= 3.0)
-           {
-            skipLabel = true;
-            break;
-           }
-        }
-      
-      if(!skipLabel)
-        {
-         ArrayResize(drawnLowPrices, drawnLowCount + 1);
-         drawnLowPrices[drawnLowCount] = price;
-         drawnLowCount++;
-        }
-      
-      CreateVRZLine("AK10X_VRZ_HTF_L_M_" + (string)i, price, swingTime, endTime, clr, STYLE_DOT, 1, label, true, false, skipLabel);
-     }
+    // Draw most recent mitigated lows (filter duplicate labels near same price)
+    int mLowsToDraw = MathMin(MaxMitigatedDraw, mLCount);
+    double drawnLowPrices[];
+    int drawnLowCount = 0;
+    
+    for(int i = 0; i < mLowsToDraw; i++)
+      {
+       double price = mitigatedLows[i].price;
+       datetime swingTime = mitigatedLows[i].time;
+       datetime endTime = GetBreakoutTimeTTF(price, swingTime, false);
+       
+       // Verify Eagle overlap
+       bool isEagle = false;
+       for(int k = 0; k < ArraySize(lowsHHTF); k++)
+         {
+          if(MathAbs(lowsHHTF[k].price - price) / pip <= HighProbVRZPips)
+            {
+             isEagle = true;
+             break;
+            }
+         }
+       
+       color clr = isEagle ? ColorEagleLow : ColorVRZ_ActiveL;
+       string label = isEagle ? "Eagle VRZ Low" : "VRZ Low";
+       
+       // Filter duplicate labels near same price (within 3 pips)
+       bool skipLabel = false;
+       for(int j = 0; j < drawnLowCount; j++)
+         {
+          if(MathAbs(drawnLowPrices[j] - price) / pip <= 3.0)
+            {
+             skipLabel = true;
+             break;
+            }
+         }
+       
+       if(!skipLabel)
+         {
+          ArrayResize(drawnLowPrices, drawnLowCount + 1);
+          drawnLowPrices[drawnLowCount] = price;
+          drawnLowCount++;
+         }
+       
+       CreateVRZLine("AK10X_VRZ_HTF_L_M_" + (string)i, price, swingTime, endTime, clr, STYLE_DOT, 1, label, true, false, skipLabel);
+      }
   }
 
 //+------------------------------------------------------------------+
@@ -872,21 +981,66 @@ void UpdateVRZones()
 //+------------------------------------------------------------------+
 void UpdateTrends()
   {
+   // Current chart price
+   double currentPrice = GetLatestBid();
+
    // Major structure swings (e.g. 5, 5 parameters)
    SwingPoint major_Highs[], major_Lows[];
-   GetHistoricalSwings(TradingPeriod, Major_SwingLeft, Major_SwingRight, major_Highs, major_Lows, 5);
+   GetHistoricalSwings(TradingPeriod, Major_SwingLeft, Major_SwingRight, major_Highs, major_Lows, 20);
    major_Trend = CalculateTrendFromSwings(major_Highs, major_Lows);
    
-   if(ArraySize(major_Highs) > 0) major_SwingHighPrice = major_Highs[0].price;
-   if(ArraySize(major_Lows) > 0)  major_SwingLowPrice  = major_Lows[0].price;
+   major_SwingHighPrice = 0.0;
+   for(int i = 0; i < ArraySize(major_Highs); i++)
+     {
+      if(major_Highs[i].price > currentPrice)
+        {
+         major_SwingHighPrice = major_Highs[i].price;
+         break;
+        }
+     }
+   if(major_SwingHighPrice <= 0.0 && ArraySize(major_Highs) > 0)
+      major_SwingHighPrice = major_Highs[0].price;
+      
+   major_SwingLowPrice = 0.0;
+   for(int i = 0; i < ArraySize(major_Lows); i++)
+     {
+      if(major_Lows[i].price < currentPrice)
+        {
+         major_SwingLowPrice = major_Lows[i].price;
+         break;
+        }
+     }
+   if(major_SwingLowPrice <= 0.0 && ArraySize(major_Lows) > 0)
+      major_SwingLowPrice = major_Lows[0].price;
    
    // Minor/Internal structure swings (e.g. 2, 2 parameters)
    SwingPoint ttf_Highs[], ttf_Lows[];
-   GetHistoricalSwings(TradingPeriod, Minor_SwingLength, Minor_SwingLength, ttf_Highs, ttf_Lows, 5);
+   GetHistoricalSwings(TradingPeriod, Minor_SwingLength, Minor_SwingLength, ttf_Highs, ttf_Lows, 20);
    ttf_Trend = CalculateTrendFromSwings(ttf_Highs, ttf_Lows);
    
-   if(ArraySize(ttf_Highs) > 0) minor_SwingHighPrice = ttf_Highs[0].price;
-   if(ArraySize(ttf_Lows) > 0)  minor_SwingLowPrice  = ttf_Lows[0].price;
+   minor_SwingHighPrice = 0.0;
+   for(int i = 0; i < ArraySize(ttf_Highs); i++)
+     {
+      if(ttf_Highs[i].price > currentPrice)
+        {
+         minor_SwingHighPrice = ttf_Highs[i].price;
+         break;
+        }
+     }
+   if(minor_SwingHighPrice <= 0.0 && ArraySize(ttf_Highs) > 0)
+      minor_SwingHighPrice = ttf_Highs[0].price;
+      
+   minor_SwingLowPrice = 0.0;
+   for(int i = 0; i < ArraySize(ttf_Lows); i++)
+     {
+      if(ttf_Lows[i].price < currentPrice)
+        {
+         minor_SwingLowPrice = ttf_Lows[i].price;
+         break;
+        }
+     }
+   if(minor_SwingLowPrice <= 0.0 && ArraySize(ttf_Lows) > 0)
+      minor_SwingLowPrice = ttf_Lows[0].price;
   }
 
 //+------------------------------------------------------------------+
@@ -1107,6 +1261,7 @@ void AddZigzagLabel(int id, datetime t, double p, string txt, bool isHigh)
       ObjectSetInteger(0, name, OBJPROP_COLOR, clrRed);
       ObjectSetInteger(0, name, OBJPROP_ANCHOR, isHigh ? ANCHOR_LOWER : ANCHOR_UPPER);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
      }
   }
 
@@ -1125,6 +1280,7 @@ void UpdateZigzagLabel(int id, datetime t, double p, string txt, bool isHigh)
       ObjectSetString(0, name, OBJPROP_TEXT, txt);
       ObjectSetInteger(0, name, OBJPROP_COLOR, clrRed);
       ObjectSetInteger(0, name, OBJPROP_ANCHOR, isHigh ? ANCHOR_LOWER : ANCHOR_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
      }
    else
      {
@@ -1185,143 +1341,1042 @@ double GetNearestSwingLowBelow(double price)
 //+------------------------------------------------------------------+
 //| Detect Setups (BOF-L, BOF-S, BOL, BOS) and Execute Limit Orders  |
 //+------------------------------------------------------------------+
-void DetectSetupsAndExecute()
+int GetRecentZigZagPoints(ZZPoint &points[], int maxCount)
   {
-   // Skip if news filter is active
-   if(IsNewsTime())
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, TradingPeriod, 1, 500, rates);
+   if(copied <= 0) return 0;
+   
+   int len = Minor_SwingLength;
+   
+   ZZPoint tempPoints[];
+   
+   bool dirUp = false;
+   double lastLow = 9999999.0;
+   double lastHigh = 0.0;
+   double prevLow = 9999999.0;
+   double prevHigh = 0.0;
+   datetime timeLow = 0;
+   datetime timeHigh = 0;
+   
+   int startIdx = copied - 1 - len;
+   bool initialized = false;
+   
+   for(int i = startIdx; i >= len; i--)
      {
-      Print("AK10XPro: Trading suspended due to news filter.");
-      return;
+      bool isPH = IsPivotHigh(rates, i, len, copied);
+      bool isPL = IsPivotLow(rates, i, len, copied);
+      if(isPH || isPL)
+        {
+         if(isPH)
+           {
+            lastHigh = rates[i].high;
+            timeHigh = rates[i].time;
+            dirUp = false;
+           }
+         else
+           {
+            lastLow = rates[i].low;
+            timeLow = rates[i].time;
+            dirUp = true;
+           }
+         startIdx = i - 1;
+         initialized = true;
+         break;
+        }
      }
      
-   // We will execute on VRZ levels. Let's build candidates list.
+   if(!initialized) return 0;
+   
+   for(int i = startIdx; i >= len; i--)
+     {
+      bool isPH = IsPivotHigh(rates, i, len, copied);
+      bool isPL = IsPivotLow(rates, i, len, copied);
+      
+      if(dirUp)
+        {
+         if(isPL && rates[i].low < lastLow)
+           {
+            lastLow = rates[i].low;
+            timeLow = rates[i].time;
+            int size = ArraySize(tempPoints);
+            if(size > 0 && !tempPoints[size-1].isHigh)
+              {
+               tempPoints[size-1].price = lastLow;
+               tempPoints[size-1].time = timeLow;
+               tempPoints[size-1].label = (lastLow >= prevLow) ? "HL" : "LL";
+              }
+           }
+         if(isPH && rates[i].high > lastLow)
+           {
+            prevHigh = lastHigh;
+            lastHigh = rates[i].high;
+            timeHigh = rates[i].time;
+            dirUp = false;
+            
+            int size = ArraySize(tempPoints);
+            ArrayResize(tempPoints, size + 1);
+            tempPoints[size].price = lastHigh;
+            tempPoints[size].time = timeHigh;
+            tempPoints[size].isHigh = true;
+            tempPoints[size].label = (lastHigh >= prevHigh) ? "HH" : "LH";
+           }
+        }
+      else
+        {
+         if(isPH && rates[i].high > lastHigh)
+           {
+            lastHigh = rates[i].high;
+            timeHigh = rates[i].time;
+            int size = ArraySize(tempPoints);
+            if(size > 0 && tempPoints[size-1].isHigh)
+              {
+               tempPoints[size-1].price = lastHigh;
+               tempPoints[size-1].time = timeHigh;
+               tempPoints[size-1].label = (lastHigh >= prevHigh) ? "HH" : "LH";
+              }
+           }
+         if(isPL && rates[i].low < lastHigh)
+           {
+            prevLow = lastLow;
+            lastLow = rates[i].low;
+            timeLow = rates[i].time;
+            dirUp = true;
+            
+            int size = ArraySize(tempPoints);
+            ArrayResize(tempPoints, size + 1);
+            tempPoints[size].price = lastLow;
+            tempPoints[size].time = timeLow;
+            tempPoints[size].isHigh = false;
+            tempPoints[size].label = (lastLow >= prevLow) ? "HL" : "LL";
+           }
+        }
+     }
+     
+   int totalPoints = ArraySize(tempPoints);
+   int returnCount = MathMin(maxCount, totalPoints);
+   ArrayResize(points, returnCount);
+   for(int i = 0; i < returnCount; i++)
+     {
+      points[i] = tempPoints[totalPoints - 1 - i];
+     }
+   return returnCount;
+  }
+
+//+------------------------------------------------------------------+
+//| Verify Touch Base Patterns                                       |
+//+------------------------------------------------------------------+
+bool IsWPattern(const ZZPoint &zz[], int size)
+  {
+   if(size < 4) return false;
+   if(!zz[0].isHigh || zz[1].isHigh || !zz[2].isHigh || zz[3].isHigh) return false;
+   bool doubleBottomOrHL = (zz[1].price >= zz[3].price);
+   bool breakout = (zz[0].price > zz[2].price);
+   return (doubleBottomOrHL && breakout);
+  }
+
+bool IsInverseHS(const ZZPoint &zz[], int size)
+  {
+   if(size < 6) return false;
+   if(!zz[0].isHigh || zz[1].isHigh || !zz[2].isHigh || zz[3].isHigh || !zz[4].isHigh || zz[5].isHigh) return false;
+   bool headLowerLeft = (zz[3].price < zz[5].price);
+   bool headLowerRight = (zz[3].price < zz[1].price);
+   bool rightHigherHead = (zz[1].price > zz[3].price);
+   bool breakout = (zz[0].price > zz[2].price);
+   return (headLowerLeft && headLowerRight && rightHigherHead && breakout);
+  }
+
+bool IsMPattern(const ZZPoint &zz[], int size)
+  {
+   if(size < 4) return false;
+   if(zz[0].isHigh || !zz[1].isHigh || zz[2].isHigh || !zz[3].isHigh) return false;
+   bool doubleTopOrLH = (zz[1].price <= zz[3].price);
+   bool breakout = (zz[0].price < zz[2].price);
+   return (doubleTopOrLH && breakout);
+  }
+
+bool IsHeadAndShoulders(const ZZPoint &zz[], int size)
+  {
+   if(size < 6) return false;
+   if(zz[0].isHigh || !zz[1].isHigh || zz[2].isHigh || !zz[3].isHigh || zz[4].isHigh || !zz[5].isHigh) return false;
+   bool headHigherLeft = (zz[3].price > zz[5].price);
+   bool headHigherRight = (zz[3].price > zz[1].price);
+   bool rightLowerHead = (zz[1].price < zz[3].price);
+   bool breakout = (zz[0].price < zz[2].price);
+   return (headHigherLeft && headHigherRight && rightLowerHead && breakout);
+  }
+
+//+------------------------------------------------------------------+
+//| Get Higher Timeframe Trend                                       |
+//+------------------------------------------------------------------+
+ENUM_TREND GetHTFTrend()
+  {
+   SwingPoint htf_Highs[], htf_Lows[];
+   GetHistoricalSwings(HigherPeriod, HTF_SwingLeft, HTF_SwingRight, htf_Highs, htf_Lows, 5);
+   return CalculateTrendFromSwings(htf_Highs, htf_Lows);
+  }
+
+//+------------------------------------------------------------------+
+//| Get Next Virgin VRZ High above entry price                       |
+//+------------------------------------------------------------------+
+double GetNextVRZHigh(double entryPrice)
+  {
+   SwingPoint highs[], lows[];
+   GetHistoricalSwings(HigherPeriod, HTF_SwingLeft, HTF_SwingRight, highs, lows, 20);
+   double nearest = 0.0;
+   double minDiff = 999999.0;
+   for(int i = 0; i < ArraySize(highs); i++)
+     {
+      if(highs[i].price > entryPrice)
+        {
+         datetime swingTime = GetExactSwingTimeTTF(highs[i].time, highs[i].price, true);
+         datetime breakoutTime = GetBreakoutTimeTTF(highs[i].price, swingTime, true);
+         if(breakoutTime == 0)
+           {
+            double diff = highs[i].price - entryPrice;
+            if(diff < minDiff)
+              {
+               minDiff = diff;
+               nearest = highs[i].price;
+              }
+           }
+        }
+     }
+   if(nearest <= 0.0)
+     {
+      if(vrzHigh_1h > entryPrice) nearest = vrzHigh_1h;
+      else if(vrzHigh_15m > entryPrice) nearest = vrzHigh_15m;
+      else nearest = entryPrice + 150.0 * GetPipSize();
+     }
+   return nearest;
+  }
+
+//+------------------------------------------------------------------+
+//| Get Next Virgin VRZ Low below entry price                        |
+//+------------------------------------------------------------------+
+double GetNextVRZLow(double entryPrice)
+  {
+   SwingPoint highs[], lows[];
+   GetHistoricalSwings(HigherPeriod, HTF_SwingLeft, HTF_SwingRight, highs, lows, 20);
+   double nearest = 0.0;
+   double minDiff = 999999.0;
+   for(int i = 0; i < ArraySize(lows); i++)
+     {
+      if(lows[i].price < entryPrice)
+        {
+         datetime swingTime = GetExactSwingTimeTTF(lows[i].time, lows[i].price, false);
+         datetime breakoutTime = GetBreakoutTimeTTF(lows[i].price, swingTime, false);
+         if(breakoutTime == 0)
+           {
+            double diff = entryPrice - lows[i].price;
+            if(diff < minDiff)
+              {
+               minDiff = diff;
+               nearest = lows[i].price;
+              }
+           }
+        }
+     }
+   if(nearest <= 0.0)
+     {
+      if(vrzLow_1h > 0 && vrzLow_1h < entryPrice) nearest = vrzLow_1h;
+      else if(vrzLow_15m > 0 && vrzLow_15m < entryPrice) nearest = vrzLow_15m;
+      else nearest = entryPrice - 150.0 * GetPipSize();
+     }
+   return nearest;
+  }
+
+//+------------------------------------------------------------------+
+//| Rule 1 - Market Context Validation                               |
+//+------------------------------------------------------------------+
+bool ValidateRule1(ENUM_SETUP_TYPE setup, string &failedReason)
+  {
+   ENUM_TREND htfTrend = GetHTFTrend();
+   ENUM_TREND ttfTrend = ttf_Trend;
+   
+   if(htfTrend != TREND_UP && htfTrend != TREND_DOWN)
+     {
+      failedReason = "HTF Trend is Sideways/Trapping";
+      return false;
+     }
+     
+   bool isBuySetup = (setup == SETUP_BOL || setup == SETUP_BOFL);
+   bool isSellSetup = (setup == SETUP_BOS || setup == SETUP_BOFS);
+   
+   if(isBuySetup && ttfTrend != TREND_UP)
+     {
+      failedReason = "TTF Trend is not UP for Buy Setup";
+      return false;
+     }
+   if(isSellSetup && ttfTrend != TREND_DOWN)
+     {
+      failedReason = "TTF Trend is not DOWN for Sell Setup";
+      return false;
+     }
+     
+   SwingPoint highs[], lows[];
+   GetHistoricalSwings(TradingPeriod, Minor_SwingLength, Minor_SwingLength, highs, lows, 5);
+   if(ArraySize(highs) < 2 || ArraySize(lows) < 2)
+     {
+      failedReason = "Insufficient swing points for Market Structure";
+      return false;
+     }
+     
+   ZZPoint zz[];
+   int zzCount = GetRecentZigZagPoints(zz, 10);
+   if(isBuySetup)
+     {
+      if(!IsWPattern(zz, zzCount) && !IsInverseHS(zz, zzCount))
+        {
+         failedReason = "No bullish Touch Base Pattern (W or iH&S)";
+         return false;
+        }
+     }
+   else if(isSellSetup)
+     {
+      if(!IsMPattern(zz, zzCount) && !IsHeadAndShoulders(zz, zzCount))
+        {
+         failedReason = "No bearish Touch Base Pattern (M or H&S)";
+         return false;
+        }
+     }
+     
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Initialize Breakout state variables                              |
+//+------------------------------------------------------------------+
+void InitBreakout(string type, double price, datetime time)
+  {
+   currentBreakout.isValid = true;
+   currentBreakout.levelType = type;
+   currentBreakout.levelPrice = price;
+   currentBreakout.time = time;
+   currentBreakout.setup = SETUP_NONE;
+   currentBreakout.reaction = "None";
+   currentBreakout.status = "N/A";
+   currentBreakout.grade = "N/A";
+   currentBreakout.riskFreeDone = false;
+   currentBreakout.currentLot = BaseLotSize;
+   currentBreakout.fillTime = 0;
+   currentBreakout.positionTicket = 0;
+   
+   PrintFormat("LTS MENTOR: Detected breakout on %s at %f, Time: %s", type, price, TimeToString(time));
+  }
+
+//+------------------------------------------------------------------+
+//| Detect fresh breakout from last closed candle                    |
+//+------------------------------------------------------------------+
+void DetectNewBreakout()
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(_Symbol, TradingPeriod, 1, 2, rates) < 2) return;
+   
    double levelHighs[] = {vrzHigh_15m, vrzHigh_1h};
    double levelLows[]  = {vrzLow_15m, vrzLow_1h};
    
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, TradingPeriod, 0, 5, rates) < 5) return;
-   
-   double buffer = StopLossBuffer * _Point;
-   
-   // Loop through lows for BOF-L & BOS
-   for(int i = 0; i < ArraySize(levelLows); i++)
-     {
-      double vrzLow = levelLows[i];
-      if(vrzLow <= 0.0) continue;
-      
-      //--- Setup 1: BOF-L (Breakout Failure Long) - Grade A+
-      bool cond1 = (rates[1].low < vrzLow && rates[1].close > vrzLow);
-      bool cond2 = (rates[2].close < vrzLow && rates[1].close > vrzLow);
-      
-      if(cond1 || cond2)
-        {
-         double breakoutLow = cond2 ? rates[2].low : rates[1].low;
-         double entry = vrzLow;
-         double sl = breakoutLow - buffer;
-         double tp = GetNearestSwingHighAbove(entry);
-         
-         double risk = entry - sl;
-         double reward = tp - entry;
-         
-         if(risk > 0 && (reward / risk) >= MinRiskReward)
-           {
-            if(!OrderExistsAtPrice(entry, ORDER_TYPE_BUY_LIMIT))
-              {
-               ExecuteOrderPair(ORDER_TYPE_BUY_LIMIT, entry, sl, tp, "BOF-L", GRADE_APLUS);
-              }
-           }
-        }
-        
-      //--- Setup 4: BOS (Breakout Short) - Grade A++
-      bool condBOS = (rates[1].close < vrzLow && rates[2].close >= vrzLow);
-      if(condBOS && ttf_Trend == TREND_DOWN)
-        {
-         double breakoutHigh = rates[1].high;
-         double entry = vrzLow;
-         double sl = breakoutHigh + buffer;
-         double tp = (vrzLow_1h > 0 && vrzLow_1h < entry) ? vrzLow_1h : GetNearestSwingLowBelow(entry);
-         
-         double risk = sl - entry;
-         double reward = entry - tp;
-         
-         if(risk > 0 && (reward / risk) >= MinRiskReward)
-           {
-            if(!OrderExistsAtPrice(entry, ORDER_TYPE_SELL_LIMIT))
-              {
-               ExecuteOrderPair(ORDER_TYPE_SELL_LIMIT, entry, sl, tp, "BOS", GRADE_APLUSPLUS);
-              }
-           }
-        }
-     }
-     
-   // Loop through highs for BOF-S & BOL
    for(int i = 0; i < ArraySize(levelHighs); i++)
      {
       double vrzHigh = levelHighs[i];
-      if(vrzHigh <= 0.0) continue;
-      
-      //--- Setup 2: BOF-S (Breakout Failure Short) - Grade A+
-      bool cond1 = (rates[1].high > vrzHigh && rates[1].close < vrzHigh);
-      bool cond2 = (rates[2].close > vrzHigh && rates[1].close < vrzHigh);
-      
-      if(cond1 || cond2)
+      if(vrzHigh > 0 && rates[0].close > vrzHigh && rates[1].close <= vrzHigh)
         {
-         double breakoutHigh = cond2 ? rates[2].high : rates[1].high;
-         double entry = vrzHigh;
-         double sl = breakoutHigh + buffer;
-         double tp = GetNearestSwingLowBelow(entry);
+         if(currentBreakout.isValid && currentBreakout.levelType == "VRZ High" && currentBreakout.levelPrice == vrzHigh && currentBreakout.time == rates[0].time)
+            return;
+            
+         InitBreakout("VRZ High", vrzHigh, rates[0].time);
+         return;
+        }
+     }
+     
+   for(int i = 0; i < ArraySize(levelLows); i++)
+     {
+      double vrzLow = levelLows[i];
+      if(vrzLow > 0 && rates[0].close < vrzLow && rates[1].close >= vrzLow)
+        {
+         if(currentBreakout.isValid && currentBreakout.levelType == "VRZ Low" && currentBreakout.levelPrice == vrzLow && currentBreakout.time == rates[0].time)
+            return;
+            
+         InitBreakout("VRZ Low", vrzLow, rates[0].time);
+         return;
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Classify price reaction and generate logical thinker setup       |
+//+------------------------------------------------------------------+
+void ClassifyReactionAndGenerateSetup()
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, TradingPeriod, 0, 50, rates);
+   if(copied <= 0) return;
+   
+   int breakoutIdx = -1;
+   for(int i = 0; i < copied; i++)
+     {
+      if(rates[i].time == currentBreakout.time)
+        {
+         breakoutIdx = i;
+         break;
+        }
+     }
+     
+   if(breakoutIdx == -1 || breakoutIdx <= 1) return;
+   
+   double postClose = rates[breakoutIdx - 1].close;
+   double vrz = currentBreakout.levelPrice;
+   
+   string reaction = "Continuation";
+   ENUM_SETUP_TYPE setup = SETUP_NONE;
+   
+   if(currentBreakout.levelType == "VRZ High")
+     {
+      if(postClose < vrz)
+        {
+         reaction = "Immediate Reversal";
+         setup = SETUP_BOFS;
+        }
+      else
+        {
+         reaction = "Continuation";
+         setup = SETUP_BOL;
+        }
+     }
+   else if(currentBreakout.levelType == "VRZ Low")
+     {
+      if(postClose > vrz)
+        {
+         reaction = "Immediate Reversal";
+         setup = SETUP_BOFL;
+        }
+      else
+        {
+         reaction = "Continuation";
+         setup = SETUP_BOS;
+        }
+     }
+     
+   currentBreakout.reaction = reaction;
+   currentBreakout.setup = setup;
+   
+   PrintFormat("LTS MENTOR: Classifying reaction: %s (Setup: %s)", reaction, EnumToString(setup));
+   
+   string failedReason = "";
+   bool r1_pass = ValidateRule1(setup, failedReason);
+   bool r2_pass = (reaction == "Continuation" || reaction == "Immediate Reversal");
+   
+   string mode = "N/A";
+   string grade = "N/A";
+   double target = 0.0;
+   ENUM_TREND htf = GetHTFTrend();
+   ENUM_TREND ttf = ttf_Trend;
+   bool r3_pass = false;
+   
+   if(setup == SETUP_BOL || setup == SETUP_BOFL)
+     {
+      if(htf == TREND_UP && ttf == TREND_UP) { mode = "Investor"; target = GetNextVRZHigh(vrz); grade = "A+++"; r3_pass = true; }
+      else if(htf == TREND_DOWN && ttf == TREND_UP) { mode = "Trader"; target = GetNearestSwingHighAbove(vrz); grade = "A++"; r3_pass = true; }
+     }
+   else if(setup == SETUP_BOS || setup == SETUP_BOFS)
+     {
+      if(htf == TREND_DOWN && ttf == TREND_DOWN) { mode = "Investor"; target = GetNextVRZLow(vrz); grade = "A+++"; r3_pass = true; }
+      else if(htf == TREND_UP && ttf == TREND_DOWN) { mode = "Trader"; target = GetNearestSwingLowBelow(vrz); grade = "A++"; r3_pass = true; }
+     }
+     
+   double sl = 0.0;
+   double buffer = StopLossBuffer * GetPipSize();
+   double breakoutHigh = rates[breakoutIdx].high;
+   double breakoutLow = rates[breakoutIdx].low;
+   
+   if(setup == SETUP_BOL || setup == SETUP_BOFL) sl = breakoutLow - buffer;
+   else sl = breakoutHigh + buffer;
+   
+   double risk = MathAbs(vrz - sl);
+   
+   // --- Fallback Target / TP calculation to prevent 0.00 Take Profit and invalid RR
+   if(target <= 0.0)
+     {
+      if(setup == SETUP_BOL || setup == SETUP_BOFL)
+        {
+         target = GetNearestSwingHighAbove(vrz);
+         if(target <= 0.0 || target <= vrz) target = GetNextVRZHigh(vrz);
+         if(target <= 0.0 || target <= vrz) target = vrz + 3.0 * risk;
+        }
+      else
+        {
+         target = GetNearestSwingLowBelow(vrz);
+         if(target <= 0.0 || target >= vrz) target = GetNextVRZLow(vrz);
+         if(target <= 0.0 || target >= vrz) target = vrz - 3.0 * risk;
+        }
+     }
+      
+   double reward = MathAbs(target - vrz);
+   double rr = (risk > 0) ? (reward / risk) : 0.0;
+   
+   bool r4_pass = (risk > 0 && rr >= MinRiskReward);
+   
+   if(r1_pass && r2_pass && r3_pass && r4_pass)
+     {
+      currentBreakout.sl = sl;
+      currentBreakout.tp = target;
+      currentBreakout.grade = grade;
+      currentBreakout.status = "Pending Order";
+      PrintFormat("LTS MENTOR: Validation Success! Setup: %s, Mode: %s, Grade: %s, RR: 1:%.1f", 
+                  EnumToString(setup), mode, grade, rr);
+     }
+   else
+     {
+      currentBreakout.isValid = true;
+      currentBreakout.status = "Failed Validation";
+      currentBreakout.sl = sl;
+      currentBreakout.tp = target;
+      currentBreakout.setup = setup;
+      currentBreakout.reaction = reaction;
+      currentBreakout.grade = grade;
+      PrintFormat("LTS MENTOR: Validation Fail! R1: %s, R2: %s, R3: %s, R4: %s (RR: 1:%.1f). Reason: %s. Keeping VRZ on HUD.", 
+                  r1_pass?"PASS":"FAIL", r2_pass?"PASS":"FAIL", r3_pass?"PASS":"FAIL", r4_pass?"PASS":"FAIL", rr, failedReason);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Get active position ticket for this EA                           |
+//+------------------------------------------------------------------+
+ulong GetRunningPositionTicket()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+         string comment = PositionGetString(POSITION_COMMENT);
+         if(StringFind(comment, "AK10X_") == 0) return ticket;
+        }
+     }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Apply Risk-Free trail logic (50% partial close + BE)             |
+//+------------------------------------------------------------------+
+void CheckAndApplyRiskFree(ulong ticket)
+  {
+   if(!PositionSelectByTicket(ticket)) return;
+   
+   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   double vol = PositionGetDouble(POSITION_VOLUME);
+   long type = PositionGetInteger(POSITION_TYPE);
+   
+   double riskDist = MathAbs(entry - currentSL);
+   if(riskDist <= 0.0) return;
+   
+   double bid = GetLatestBid();
+   double ask = GetLatestAsk();
+   double currentPrice = (type == POSITION_TYPE_BUY) ? bid : ask;
+   
+   bool isBuy = (type == POSITION_TYPE_BUY);
+   bool conditionMet = false;
+   
+   if(isBuy)
+     {
+      if(currentPrice - entry >= riskDist) conditionMet = true;
+     }
+   else
+     {
+      if(entry - currentPrice >= riskDist) conditionMet = true;
+     }
+     
+   if(conditionMet)
+     {
+      double closeVol = vol * 0.5;
+      double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      closeVol = MathRound(closeVol / step) * step;
+      if(closeVol < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+         closeVol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
          
-         double risk = sl - entry;
-         double reward = entry - tp;
-         
-         if(risk > 0 && (reward / risk) >= MinRiskReward)
-           {
-            if(!OrderExistsAtPrice(entry, ORDER_TYPE_SELL_LIMIT))
-              {
-               ExecuteOrderPair(ORDER_TYPE_SELL_LIMIT, entry, sl, tp, "BOF-S", GRADE_APLUS);
-              }
-           }
+      if(closeVol >= vol) closeVol = 0.0;
+      
+      bool closeOk = true;
+      if(closeVol > 0.0)
+        {
+         closeOk = trade.PositionClosePartial(ticket, closeVol);
         }
         
-      //--- Setup 3: BOL (Breakout Long) - Grade A++
-      bool condBOL = (rates[1].close > vrzHigh && rates[2].close <= vrzHigh);
-      if(condBOL && ttf_Trend == TREND_UP)
+      if(closeOk)
         {
-         double breakoutLow = rates[1].low;
-         double entry = vrzHigh;
-         double sl = breakoutLow - buffer;
-         double tp = (vrzHigh_1h > 0 && vrzHigh_1h > entry) ? vrzHigh_1h : GetNearestSwingHighAbove(entry);
-         
-         double risk = entry - sl;
-         double reward = tp - entry;
-         
-         if(risk > 0 && (reward / risk) >= MinRiskReward)
+         if(trade.PositionModify(ticket, entry, tp))
            {
-            if(!OrderExistsAtPrice(entry, ORDER_TYPE_BUY_LIMIT))
-              {
-               ExecuteOrderPair(ORDER_TYPE_BUY_LIMIT, entry, sl, tp, "BOL", GRADE_APLUSPLUS);
-              }
+            currentBreakout.riskFreeDone = true;
+            currentBreakout.sl = entry;
+            currentBreakout.currentLot = vol - closeVol;
+            PrintFormat("LTS MENTOR: Risk-Free activated! Closed partial %f lot, moved remaining to Break-Even at %f", closeVol, entry);
            }
         }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Check if a pending order already exists near a specific price   |
+//| Execute local market order on VRZ retest                         |
 //+------------------------------------------------------------------+
-bool OrderExistsAtPrice(double price, ENUM_ORDER_TYPE orderType)
+void ExecuteMarketOrder()
   {
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   if(!AutoTradingEnabled || IsNewsTime())
      {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket > 0 && OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+      Print("LTS MENTOR: Order execution blocked (Algo Offline or news active).");
+      return;
+     }
+     
+   double entry = currentBreakout.levelPrice;
+   double sl = currentBreakout.sl;
+   double tp = currentBreakout.tp;
+   ENUM_SETUP_TYPE setup = currentBreakout.setup;
+   
+   string setupName = EnumToString(setup);
+   StringReplace(setupName, "SETUP_", "");
+   
+   string comment = "AK10X_" + setupName + "_" + currentBreakout.grade;
+   double lot = CalculateLotSize(entry, sl);
+   
+   bool res = false;
+   if(setup == SETUP_BOL || setup == SETUP_BOFL)
+     {
+      double ask = GetLatestAsk();
+      res = trade.Buy(lot, _Symbol, ask, sl, tp, comment);
+     }
+   else if(setup == SETUP_BOS || setup == SETUP_BOFS)
+     {
+      double bid = GetLatestBid();
+      res = trade.Sell(lot, _Symbol, bid, sl, tp, comment);
+     }
+     
+   if(res)
+     {
+      currentBreakout.status = "Running Order";
+      currentBreakout.fillTime = TimeCurrent();
+      currentBreakout.positionTicket = GetRunningPositionTicket();
+      WriteJournal("EXECUTE", currentBreakout.positionTicket, comment, currentBreakout.grade, entry, sl, tp);
+      PrintFormat("LTS MENTOR: Retest filled! Executed Market Order for %s at %f", setupName, entry);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Run core state machine logic                                     |
+//+------------------------------------------------------------------+
+void ProcessBreakoutStateMachine()
+  {
+   ulong runningTicket = GetRunningPositionTicket();
+   if(runningTicket > 0)
+     {
+      currentBreakout.isValid = true;
+      currentBreakout.status = "Running Order";
+      currentBreakout.positionTicket = runningTicket;
+      
+      if(PositionSelectByTicket(runningTicket))
         {
-         if(OrderGetInteger(ORDER_TYPE) == orderType && MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - price) < 2 * _Point)
-            return true;
+         currentBreakout.currentLot = PositionGetDouble(POSITION_VOLUME);
+         currentBreakout.sl = PositionGetDouble(POSITION_SL);
+         currentBreakout.tp = PositionGetDouble(POSITION_TP);
+         currentBreakout.fillTime = (datetime)PositionGetInteger(POSITION_TIME);
+        }
+        
+      if(EnableRiskFree && !currentBreakout.riskFreeDone)
+        {
+         CheckAndApplyRiskFree(runningTicket);
+        }
+      return;
+     }
+     
+   if(currentBreakout.status == "Running Order" && runningTicket == 0)
+     {
+      currentBreakout.status = "Closed";
+      currentBreakout.isValid = false;
+      currentBreakout.setup = SETUP_NONE;
+      currentBreakout.reaction = "None";
+      return;
+     }
+     
+   // Check if a new breakout occurred (this will overwrite the current breakout if it is different)
+   DetectNewBreakout();
+   
+   if(!currentBreakout.isValid)
+     {
+      return;
+     }
+     
+   if(currentBreakout.status == "N/A" || currentBreakout.status == "")
+     {
+      datetime currentBarTime = iTime(_Symbol, TradingPeriod, 0);
+      if(currentBarTime > currentBreakout.time)
+        {
+         ClassifyReactionAndGenerateSetup();
+        }
+      return;
+     }
+     
+   if(currentBreakout.status == "Failed Validation")
+     {
+      double bid = GetLatestBid();
+      bool isLong = (currentBreakout.setup == SETUP_BOL || currentBreakout.setup == SETUP_BOFL);
+      
+      bool hitTP = isLong ? (bid >= currentBreakout.tp) : (bid <= currentBreakout.tp);
+      bool hitSL = isLong ? (bid <= currentBreakout.sl) : (bid >= currentBreakout.sl);
+      
+      if(hitTP || hitSL)
+        {
+         currentBreakout.isValid = false;
+         currentBreakout.status = "N/A";
+         currentBreakout.setup = SETUP_NONE;
+         currentBreakout.reaction = "None";
+         Print("LTS MENTOR: Failed validation breakout invalidated. Price hit TP/SL.");
+        }
+      return;
+     }
+     
+   if(currentBreakout.status == "Pending Order")
+     {
+      double bid = GetLatestBid();
+      double ask = GetLatestAsk();
+      
+      bool isLong = (currentBreakout.setup == SETUP_BOL || currentBreakout.setup == SETUP_BOFL);
+      
+      bool hitTP = isLong ? (bid >= currentBreakout.tp) : (bid <= currentBreakout.tp);
+      bool hitSL = isLong ? (bid <= currentBreakout.sl) : (bid >= currentBreakout.sl);
+      
+      if(hitTP || hitSL)
+        {
+         currentBreakout.isValid = false;
+         currentBreakout.status = "N/A";
+         currentBreakout.setup = SETUP_NONE;
+         currentBreakout.reaction = "None";
+         Print("LTS MENTOR: Breakout invalidated. Price hit TP/SL before retest.");
+         return;
+        }
+        
+      if(currentBreakout.reaction == "Continuation")
+        {
+         double nextSwing = isLong ? GetNearestSwingHighAbove(currentBreakout.levelPrice) : GetNearestSwingLowBelow(currentBreakout.levelPrice);
+         double nextVRZ = isLong ? GetRecentVirginHigh(HigherPeriod, HTF_SwingLeft, HTF_SwingRight) : GetRecentVirginLow(HigherPeriod, HTF_SwingLeft, HTF_SwingRight);
+         
+         if(isLong)
+           {
+            if(nextVRZ <= currentBreakout.levelPrice) nextVRZ = 9999999.0;
+            if(bid >= nextSwing || bid >= nextVRZ)
+              {
+               currentBreakout.isValid = false;
+               currentBreakout.status = "N/A";
+               currentBreakout.setup = SETUP_NONE;
+               currentBreakout.reaction = "Direct Breakout";
+               Print("LTS MENTOR: Invalidated (Direct Breakout - price hit next Swing/VRZ before retest).");
+               return;
+              }
+           }
+         else
+           {
+            if(nextVRZ >= currentBreakout.levelPrice || nextVRZ <= 0.0) nextVRZ = 0.0;
+            if(bid <= nextSwing || (nextVRZ > 0 && bid <= nextVRZ))
+              {
+               currentBreakout.isValid = false;
+               currentBreakout.status = "N/A";
+               currentBreakout.setup = SETUP_NONE;
+               currentBreakout.reaction = "Direct Breakout";
+               Print("LTS MENTOR: Invalidated (Direct Breakout - price hit next Swing/VRZ before retest).");
+               return;
+              }
+           }
+        }
+        
+      bool trigger = false;
+      if(isLong)
+        {
+         if(ask <= currentBreakout.levelPrice) trigger = true;
+        }
+      else
+        {
+         if(bid >= currentBreakout.levelPrice) trigger = true;
+        }
+        
+      if(trigger)
+        {
+         ExecuteMarketOrder();
         }
      }
-   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Verify historical breakout validity and recover state on startup|
+//+------------------------------------------------------------------+
+bool CheckHistoricalBreakoutValidity(string type, double price, datetime time, int breakoutIdxInRates)
+  {
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, TradingPeriod, 0, breakoutIdxInRates + 5, rates);
+   if(copied <= 0) return false;
+   
+   int idx = -1;
+   for(int i = 0; i < copied; i++)
+     {
+      if(rates[i].time == time) { idx = i; break; }
+     }
+   if(idx == -1 || idx == 0) return false;
+   
+   // Pre-calculate SL and Target TP in case we return early for idx == 1
+   double sl = 0.0;
+   double buffer = StopLossBuffer * GetPipSize();
+   double breakoutHigh = rates[idx].high;
+   double breakoutLow = rates[idx].low;
+   
+   if(type == "VRZ High") sl = breakoutLow - buffer;
+   else sl = breakoutHigh + buffer;
+   
+   double target = 0.0;
+   ENUM_TREND htf = GetHTFTrend();
+   ENUM_TREND ttf = ttf_Trend;
+   double risk = MathAbs(price - sl);
+   
+   if(type == "VRZ High")
+     {
+      if(htf == TREND_UP && ttf == TREND_UP) { target = GetNextVRZHigh(price); }
+      else { target = GetNearestSwingHighAbove(price); }
+      
+      if(target <= 0.0 || target <= price) target = GetNextVRZHigh(price);
+      if(target <= 0.0 || target <= price) target = price + 3.0 * risk;
+     }
+   else
+     {
+      if(htf == TREND_DOWN && ttf == TREND_DOWN) { target = GetNextVRZLow(price); }
+      else { target = GetNearestSwingLowBelow(price); }
+      
+      if(target <= 0.0 || target >= price) target = GetNextVRZLow(price);
+      if(target <= 0.0 || target >= price) target = price - 3.0 * risk;
+     }
+   
+   // If the breakout candle is the last closed candle (index 1), rules validation is not yet complete.
+   // We recover it as a fresh breakout (status = "") so that the state machine can check it.
+   if(idx == 1)
+     {
+      currentBreakout.isValid = true;
+      currentBreakout.levelType = type;
+      currentBreakout.levelPrice = price;
+      currentBreakout.time = time;
+      currentBreakout.sl = sl;
+      currentBreakout.tp = target;
+      currentBreakout.setup = SETUP_NONE;
+      currentBreakout.reaction = "None";
+      currentBreakout.status = "";
+      currentBreakout.grade = "N/A";
+      currentBreakout.riskFreeDone = false;
+      currentBreakout.currentLot = BaseLotSize;
+      currentBreakout.fillTime = 0;
+      currentBreakout.positionTicket = 0;
+      
+      PrintFormat("LTS MENTOR: Startup recovered fresh breakout on %s at %f", type, price);
+      return true;
+     }
+     
+   double postClose = rates[idx - 1].close;
+   string reaction = "Continuation";
+   ENUM_SETUP_TYPE setup = SETUP_NONE;
+   
+   if(type == "VRZ High")
+     {
+      if(postClose < price) { reaction = "Immediate Reversal"; setup = SETUP_BOFS; }
+      else { reaction = "Continuation"; setup = SETUP_BOL; }
+     }
+   else
+     {
+      if(postClose > price) { reaction = "Immediate Reversal"; setup = SETUP_BOFL; }
+      else { reaction = "Continuation"; setup = SETUP_BOS; }
+     }
+     
+   string grade = "A++";
+   
+   if(setup == SETUP_BOL || setup == SETUP_BOFL)
+     {
+      if(htf == TREND_UP && ttf == TREND_UP) { grade = "A+++"; }
+      else { grade = "A++"; }
+     }
+   else
+     {
+      if(htf == TREND_DOWN && ttf == TREND_DOWN) { grade = "A+++"; }
+      else { grade = "A++"; }
+     }
+     
+   double reward = MathAbs(target - price);
+   double rr = (risk > 0) ? (reward / risk) : 0.0;
+   
+   if(risk <= 0.0) return false;
+   
+   string failedReason = "";
+   bool r1_pass = ValidateRule1(setup, failedReason);
+   bool r2_pass = (reaction == "Continuation" || reaction == "Immediate Reversal");
+   bool r3_pass = false;
+   if(setup == SETUP_BOL || setup == SETUP_BOFL)
+     {
+      if(htf == TREND_UP && ttf == TREND_UP) { r3_pass = true; }
+      else if(htf == TREND_DOWN && ttf == TREND_UP) { r3_pass = true; }
+     }
+   else if(setup == SETUP_BOS || setup == SETUP_BOFS)
+     {
+      if(htf == TREND_DOWN && ttf == TREND_DOWN) { r3_pass = true; }
+      else if(htf == TREND_UP && ttf == TREND_DOWN) { r3_pass = true; }
+     }
+   bool r4_pass = (rr >= MinRiskReward);
+   
+   bool passed = (r1_pass && r2_pass && r3_pass && r4_pass);
+   
+   bool isLong = (setup == SETUP_BOL || setup == SETUP_BOFL);
+   
+   for(int i = idx - 2; i >= 0; i--)
+     {
+      double highVal = rates[i].high;
+      double lowVal = rates[i].low;
+      
+      bool hitTP = isLong ? (highVal >= target) : (lowVal <= target);
+      bool hitSL = isLong ? (lowVal <= sl) : (highVal >= sl);
+      if(hitTP || hitSL) return false;
+      
+      if(passed)
+        {
+         bool filled = false;
+         if(isLong) { if(lowVal <= price) filled = true; }
+         else { if(highVal >= price) filled = true; }
+         if(filled) return false;
+         
+         if(reaction == "Continuation")
+           {
+            double nextSwing = isLong ? GetNearestSwingHighAbove(price) : GetNearestSwingLowBelow(price);
+            if(isLong) { if(highVal >= nextSwing) return false; }
+            else { if(lowVal <= nextSwing) return false; }
+           }
+        }
+     }
+     
+   currentBreakout.isValid = true;
+   currentBreakout.levelType = type;
+   currentBreakout.levelPrice = price;
+   currentBreakout.time = time;
+   currentBreakout.sl = sl;
+   currentBreakout.tp = target;
+   currentBreakout.setup = setup;
+   currentBreakout.reaction = reaction;
+   currentBreakout.status = passed ? "Pending Order" : "Failed Validation";
+   currentBreakout.grade = grade;
+   currentBreakout.riskFreeDone = false;
+   currentBreakout.currentLot = BaseLotSize;
+   currentBreakout.fillTime = 0;
+   currentBreakout.positionTicket = 0;
+   
+   PrintFormat("LTS MENTOR: Startup recovered valid breakout on %s at %f, Status: %s", type, price, currentBreakout.status);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Startup scanning routine to recover active breakout states        |
+//+------------------------------------------------------------------+
+void DetectBreakoutFromHistory()
+  {
+   ulong runningTicket = GetRunningPositionTicket();
+   if(runningTicket > 0)
+     {
+      if(PositionSelectByTicket(runningTicket))
+        {
+         string comment = PositionGetString(POSITION_COMMENT);
+         string parts[];
+         int splitCount = StringSplit(comment, '_', parts);
+         
+         currentBreakout.isValid = true;
+         currentBreakout.status = "Running Order";
+         currentBreakout.positionTicket = runningTicket;
+         currentBreakout.levelPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         currentBreakout.sl = PositionGetDouble(POSITION_SL);
+         currentBreakout.tp = PositionGetDouble(POSITION_TP);
+         currentBreakout.currentLot = PositionGetDouble(POSITION_VOLUME);
+         currentBreakout.fillTime = (datetime)PositionGetInteger(POSITION_TIME);
+         
+         if(splitCount >= 3)
+           {
+            string setupName = parts[2];
+            if(setupName == "BOL") { currentBreakout.setup = SETUP_BOL; currentBreakout.reaction = "Continuation"; currentBreakout.levelType = "VRZ High"; }
+            else if(setupName == "BOS") { currentBreakout.setup = SETUP_BOS; currentBreakout.reaction = "Continuation"; currentBreakout.levelType = "VRZ Low"; }
+            else if(setupName == "BOFS") { currentBreakout.setup = SETUP_BOFS; currentBreakout.reaction = "Immediate Reversal"; currentBreakout.levelType = "VRZ High"; }
+            else if(setupName == "BOFL") { currentBreakout.setup = SETUP_BOFL; currentBreakout.reaction = "Immediate Reversal"; currentBreakout.levelType = "VRZ Low"; }
+           }
+         if(splitCount >= 4) currentBreakout.grade = parts[3];
+         
+         bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+         double entry = currentBreakout.levelPrice;
+         if(isBuy && currentBreakout.sl >= entry - _Point) currentBreakout.riskFreeDone = true;
+         if(!isBuy && currentBreakout.sl <= entry + _Point && currentBreakout.sl > 0) currentBreakout.riskFreeDone = true;
+         
+         Print("LTS MENTOR: Startup recovered running position.");
+         return;
+        }
+     }
+     
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, TradingPeriod, 1, 200, rates);
+   if(copied <= 0) return;
+   
+   // Fetch all historical swings to scan for breakouts
+   SwingPoint highsHTF[], lowsHTF[];
+   GetHistoricalSwings(HigherPeriod, HTF_SwingLeft, HTF_SwingRight, highsHTF, lowsHTF, 150);
+   
+   SwingPoint highsHHTF[], lowsHHTF[];
+   GetHistoricalSwings(HigherHighPeriod, HTF_SwingLeft, HTF_SwingRight, highsHHTF, lowsHHTF, 150);
+   
+   for(int idx = 0; idx < copied - 2; idx++)
+     {
+      datetime tVal = rates[idx].time;
+      double cVal = rates[idx].close;
+      double prevCVal = rates[idx+1].close;
+      
+      // Check Highs HTF
+      for(int h = 0; h < ArraySize(highsHTF); h++)
+        {
+         double p = highsHTF[h].price;
+         datetime t = highsHTF[h].time;
+         if(tVal >= t && cVal > p && prevCVal <= p)
+           {
+            if(CheckHistoricalBreakoutValidity("VRZ High", p, tVal, idx + 1)) return; // idx + 1 because rates starts at chart index 1
+           }
+        }
+      // Check Highs HHTF
+      for(int h = 0; h < ArraySize(highsHHTF); h++)
+        {
+         double p = highsHHTF[h].price;
+         datetime t = highsHHTF[h].time;
+         if(tVal >= t && cVal > p && prevCVal <= p)
+           {
+            if(CheckHistoricalBreakoutValidity("VRZ High", p, tVal, idx + 1)) return;
+           }
+        }
+      // Check Lows HTF
+      for(int l = 0; l < ArraySize(lowsHTF); l++)
+        {
+         double p = lowsHTF[l].price;
+         datetime t = lowsHTF[l].time;
+         if(tVal >= t && cVal < p && prevCVal >= p)
+           {
+            if(CheckHistoricalBreakoutValidity("VRZ Low", p, tVal, idx + 1)) return;
+           }
+        }
+      // Check Lows HHTF
+      for(int l = 0; l < ArraySize(lowsHHTF); l++)
+        {
+         double p = lowsHHTF[l].price;
+         datetime t = lowsHHTF[l].time;
+         if(tVal >= t && cVal < p && prevCVal >= p)
+           {
+            if(CheckHistoricalBreakoutValidity("VRZ Low", p, tVal, idx + 1)) return;
+           }
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1357,95 +2412,6 @@ double CalculateLotSize(double entry, double sl)
    return lot;
   }
 
-//+------------------------------------------------------------------+
-//| Execute a dual order pair (Lot 1 and Lot 2)                      |
-//+------------------------------------------------------------------+
-void ExecuteOrderPair(ENUM_ORDER_TYPE orderType, double entry, double sl, double tp, string setupName, ENUM_GRADE grade)
-  {
-   double lot = CalculateLotSize(entry, sl);
-   double risk = MathAbs(entry - sl);
-   
-   double tp_lot1 = (orderType == ORDER_TYPE_BUY_LIMIT) ? (entry + risk) : (entry - risk);
-   
-   string gradeStr = (grade == GRADE_APLUSPLUS) ? "A++" : "A+";
-   
-   string comment1 = "AK10X_L1_" + setupName + "_" + gradeStr;
-   string comment2 = "AK10X_L2_" + setupName + "_" + gradeStr;
-   
-   bool res1 = false;
-   bool res2 = false;
-   
-   if(orderType == ORDER_TYPE_BUY_LIMIT)
-     {
-      res1 = trade.BuyLimit(lot, entry, _Symbol, sl, tp_lot1, ORDER_TIME_GTC, 0, comment1);
-      res2 = trade.BuyLimit(lot, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment2);
-     }
-   else
-     {
-      res1 = trade.SellLimit(lot, entry, _Symbol, sl, tp_lot1, ORDER_TIME_GTC, 0, comment1);
-      res2 = trade.SellLimit(lot, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, comment2);
-     }
-     
-   if(res1 && res2)
-     {
-      PrintFormat("AK10XPro: Placed %s dual orders (Grade %s) at %f, SL: %f, TP1: %f, TP2: %f", 
-                  EnumToString(orderType), gradeStr, entry, sl, tp_lot1, tp);
-      WriteJournal("PENDING", 0, setupName, gradeStr, entry, sl, tp);
-     }
-  }
-
-//+------------------------------------------------------------------+
-//| Execute Manual Market Order (triggered by HUD buttons)           |
-//+------------------------------------------------------------------+
-void ExecuteManualOrder(ENUM_ORDER_TYPE orderType)
-  {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   
-   double entry = (orderType == ORDER_TYPE_BUY) ? ask : bid;
-   
-   // Set SL/TP from the current minor swing structure
-   double sl = (orderType == ORDER_TYPE_BUY) ? minor_SwingLowPrice : minor_SwingHighPrice;
-   double tp = (orderType == ORDER_TYPE_BUY) ? minor_SwingHighPrice : minor_SwingLowPrice;
-   
-   if(sl <= 0.0 || tp <= 0.0)
-     {
-      Print("AK10XPro: Cannot execute manual trade. Swing structure levels are missing.");
-      return;
-     }
-     
-   double risk = MathAbs(entry - sl);
-   if(risk <= 0.0) return;
-   
-   double lot = CalculateLotSize(entry, sl);
-   double tp_lot1 = (orderType == ORDER_TYPE_BUY) ? (entry + risk) : (entry - risk);
-   
-   string comment1 = "AK10X_L1_Manual";
-   string comment2 = "AK10X_L2_Manual";
-   
-   bool r1 = false, r2 = false;
-   if(orderType == ORDER_TYPE_BUY)
-     {
-      r1 = trade.Buy(lot, _Symbol, ask, sl, tp_lot1, comment1);
-      r2 = trade.Buy(lot, _Symbol, ask, sl, tp, comment2);
-     }
-   else
-     {
-      r1 = trade.Sell(lot, _Symbol, bid, sl, tp_lot1, comment1);
-      r2 = trade.Sell(lot, _Symbol, bid, sl, tp, comment2);
-     }
-     
-   if(r1 && r2)
-     {
-      PrintFormat("AK10XPro: Manual Market order executed: %s, Lots: %f, SL: %f, TP1: %f, TP2: %f",
-                  EnumToString(orderType), lot, sl, tp_lot1, tp);
-      WriteJournal("MANUAL", 0, EnumToString(orderType), "Manual", entry, sl, tp);
-     }
-  }
-
-//+------------------------------------------------------------------+
-//| Close all open positions from this EA                            |
-//+------------------------------------------------------------------+
 void CloseAllPositions()
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -1456,127 +2422,22 @@ void CloseAllPositions()
          trade.PositionClose(ticket);
         }
      }
-   Print("AK10XPro: Manual CLOSE ALL executed.");
   }
 
-//+------------------------------------------------------------------+
-//| Manage Active Positions (1R Break-Even modification)             |
 //+------------------------------------------------------------------+
 void ManageActivePositions()
   {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   ulong ticket = GetRunningPositionTicket();
+   if(ticket > 0 && EnableRiskFree && !currentBreakout.riskFreeDone)
      {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket <= 0) continue;
-      
-      if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-        {
-         string comment = PositionGetString(POSITION_COMMENT);
-         if(StringFind(comment, "AK10X_L2") == 0) // Lot 2 position
-           {
-            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-            double currentSL = PositionGetDouble(POSITION_SL);
-            double currentTP = PositionGetDouble(POSITION_TP);
-            long posType = PositionGetInteger(POSITION_TYPE);
-            
-            bool isBuy = (posType == POSITION_TYPE_BUY);
-            bool alreadyBE = false;
-            
-            if(isBuy && currentSL >= entryPrice - _Point) alreadyBE = true;
-            if(!isBuy && currentSL <= entryPrice + _Point) alreadyBE = true;
-            
-            if(!alreadyBE)
-              {
-               // Check if corresponding Lot 1 is closed
-               bool lot1Exists = false;
-               for(int j = PositionsTotal() - 1; j >= 0; j--)
-                 {
-                  ulong t2 = PositionGetTicket(j);
-                  if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-                    {
-                     string comment2 = PositionGetString(POSITION_COMMENT);
-                     if(StringFind(comment2, "AK10X_L1") == 0)
-                       {
-                        lot1Exists = true;
-                        break;
-                       }
-                    }
-                 }
-                 
-               if(!lot1Exists)
-                 {
-                  if(trade.PositionModify(ticket, entryPrice, currentTP))
-                    {
-                     PrintFormat("AK10XPro: Lot 1 closed. Moved Lot 2 position (Ticket: %d) to Break-Even at %f", ticket, entryPrice);
-                     WriteJournal("BREAKEVEN", ticket, comment, "", entryPrice, entryPrice, currentTP);
-                    }
-                 }
-              }
-           }
-        }
+      CheckAndApplyRiskFree(ticket);
      }
   }
 
-//+------------------------------------------------------------------+
-//| Manage Pending Orders (Cleanup of invalidated setups)            |
-//+------------------------------------------------------------------+
 void ManagePendingOrders()
   {
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket <= 0) continue;
-      
-      if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == MagicNumber)
-        {
-         double entry = OrderGetDouble(ORDER_PRICE_OPEN);
-         double sl = OrderGetDouble(ORDER_SL);
-         double tp = OrderGetDouble(ORDER_TP);
-         long type = OrderGetInteger(ORDER_TYPE);
-         string comment = OrderGetString(ORDER_COMMENT);
-         
-         MqlRates rates[];
-         if(CopyRates(_Symbol, TradingPeriod, 0, 2, rates) < 2) continue;
-         double lastClose = rates[1].close;
-         
-         bool cancel = false;
-         string reason = "";
-         
-         // 1. Cancel if price closes past SL before getting filled
-         if(type == ORDER_TYPE_BUY_LIMIT && lastClose < sl)
-           {
-            cancel = true;
-            reason = "Price closed below SL";
-           }
-         else if(type == ORDER_TYPE_SELL_LIMIT && lastClose > sl)
-           {
-            cancel = true;
-            reason = "Price closed above SL";
-           }
-           
-         // 2. Cancel if price reaches TP before getting filled
-         if(type == ORDER_TYPE_BUY_LIMIT && rates[0].high >= tp)
-           {
-            cancel = true;
-            reason = "Target reached before fill";
-           }
-         else if(type == ORDER_TYPE_SELL_LIMIT && rates[0].low <= tp)
-           {
-            cancel = true;
-            reason = "Target reached before fill";
-           }
-           
-         if(cancel)
-           {
-            if(trade.OrderDelete(ticket))
-              {
-               PrintFormat("AK10XPro: Cancelled pending order (Ticket: %d, Setup: %s) because: %s", ticket, comment, reason);
-               WriteJournal("CANCEL", ticket, comment, "", entry, sl, tp);
-              }
-           }
-        }
-     }
-   }
+   // Monitored locally inside ProcessBreakoutStateMachine
+  }
 
 //--- News Event Info Structure
 struct NewsEventInfo
@@ -2007,9 +2868,11 @@ void ScanClosedPositions()
 //+------------------------------------------------------------------+
 string CleanTrendString(ENUM_TREND trend)
   {
-   string s = EnumToString(trend);
-   StringReplace(s, "_", " ");
-   return s;
+   if(trend == TREND_UP) return "UP TREND";
+   if(trend == TREND_DOWN) return "DOWN TREND";
+   if(trend == TREND_SIDEWAYS) return "SIDEWAYS";
+   if(trend == TREND_TRAPPING) return "TRAPPING TREND";
+   return "UNKNOWN";
   }
 
 //+------------------------------------------------------------------+
@@ -2026,107 +2889,289 @@ color GetTrendColor(ENUM_TREND trend)
 //+------------------------------------------------------------------+
 //| UI visual dashboard implementation (HUD matching attachment)    |
 //+------------------------------------------------------------------+
+
+//--- Anti-flicker HUD rendering variables and helpers
+string g_drawnHUDObjects[];
+int g_drawnHUDCount = 0;
+
+void ClearDrawnHUDList()
+  {
+   g_drawnHUDCount = 0;
+   ArrayResize(g_drawnHUDObjects, 0);
+  }
+
+void RegisterDrawnHUD(string name)
+  {
+   ArrayResize(g_drawnHUDObjects, g_drawnHUDCount + 1);
+   g_drawnHUDObjects[g_drawnHUDCount] = name;
+   g_drawnHUDCount++;
+  }
+
+void DeleteUnusedHUDObjects()
+  {
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = total - 1; i >= 0; i--)
+     {
+      string name = ObjectName(0, i, -1, -1);
+      if(StringFind(name, "AK10X_HUD_") == 0) // starts with AK10X_HUD_
+        {
+         bool found = false;
+         for(int j = 0; j < g_drawnHUDCount; j++)
+           {
+            if(g_drawnHUDObjects[j] == name)
+              {
+               found = true;
+               break;
+              }
+           }
+         if(!found)
+           {
+            ObjectDelete(0, name);
+           }
+        }
+     }
+  }
+
 void UpdateHUD()
   {
-   // Delete previous HUD objects
-   ObjectsDeleteAll(0, "AK10X_HUD_");
+   // Clear previous list of drawn objects
+   ClearDrawnHUDList();
    
    int xStart = 20;
    int yStart = 40;
    int ySpacing = 16;
-   int width = 290;
+   int width = 310;
    
-   int linesCount = 18;
+   if(HUD_Minimized)
+     {
+      int minHeight = 36;
+      CreateHUDPanel("AK10X_HUD_Bg", xStart - 10, yStart - 10, width, minHeight, ColorHUD_Bg, 1);
+      CreateHUDText("AK10X_HUD_Title", "AK10X Pro", xStart, yStart, 10, true, clrTurquoise);
+      CreateHUDButton("AK10X_HUD_Btn_MinMax", "[+]", xStart + width - 35, yStart - 2, 20, 16, C'30,30,30', clrTurquoise);
+      
+      DeleteUnusedHUDObjects();
+      ChartRedraw(0);
+      return;
+     }
+
+   int linesCount = 48;
    int btnHeight = 22;
    int height = (yStart + linesCount * ySpacing + btnHeight + 12) - (yStart - 10);
-     
+   
    // Dashboard Box Panel
    CreateHUDPanel("AK10X_HUD_Bg", xStart - 10, yStart - 10, width, height, ColorHUD_Bg, 1);
-    
+   
    int line = 0;
-   string htfStr = EnumToString(HigherPeriod);
-    
+   
    // Title
-   CreateHUDText("AK10X_HUD_Title", "AK10X PRO AUTO TRADER", xStart, yStart + (line++ * ySpacing), 10, true, clrTurquoise);
-    
+   CreateHUDText("AK10X_HUD_Title", "AK10X Pro", xStart, yStart + (line++ * ySpacing), 10, true, clrTurquoise);
+   CreateHUDButton("AK10X_HUD_Btn_MinMax", "[-]", xStart + width - 35, yStart - 2, 20, 16, C'30,30,30', clrTurquoise);
+   
    line++; // spacer
    
-   // Header
+   // --- Section 1: HIGHER TIME FRAME ---
+   string htfStr = EnumToString(HigherPeriod);
    CreateHUDText("AK10X_HUD_HtfHeader", "HIGHER TIME FRAME (" + htfStr + ")", xStart, yStart + (line++ * ySpacing), 8, true, clrSilver);
    
-   // 1. HTF Trend state
    SwingPoint htf_Highs[], htf_Lows[];
    GetHistoricalSwings(HigherPeriod, HTF_SwingLeft, HTF_SwingRight, htf_Highs, htf_Lows, 5);
    ENUM_TREND htfTrendState = CalculateTrendFromSwings(htf_Highs, htf_Lows);
    
-   string trendStr = "  Trend: " + CleanTrendString(htfTrendState);
+   string trendStr = "  TREND: " + CleanTrendString(htfTrendState);
    color trendColor = GetTrendColor(htfTrendState);
    CreateHUDText("AK10X_HUD_HtfTrend", trendStr, xStart, yStart + (line++ * ySpacing), 8, true, trendColor);
    
-   // Running price
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bid = GetLatestBid();
    
-   // 2. VRZ High distance (VRZ High - Running Price)
-   string vrzHighStr = "  VRZ High: N/A";
+   string htfVrzHighStr = "  VRZ High: N/A";
    if(vrzHigh_15m > 0)
      {
       double diff = (vrzHigh_15m - bid) / GetPipDivisor();
-      int diffPts = (int)MathRound(diff);
-      string sign = (diffPts >= 0) ? "+" : "";
-      vrzHighStr = "  VRZ High: " + DoubleToString(vrzHigh_15m, _Digits) + " (" + sign + (string)diffPts + ")";
+      string sign = (diff >= 0) ? "+" : "";
+      htfVrzHighStr = "  VRZ High: " + DoubleToString(vrzHigh_15m, _Digits) + " (" + sign + DoubleToString(diff, 1) + ")";
      }
-   CreateHUDText("AK10X_HUD_HtfVrzHigh", vrzHighStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
+   CreateHUDText("AK10X_HUD_HtfVrzHigh", htfVrzHighStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
    
-   // 3. VRZ Low distance (VRZ Low - Running Price)
-   string vrzLowStr = "  VRZ Low: N/A";
+   string htfVrzLowStr = "  VRZ Low: N/A";
    if(vrzLow_15m > 0)
      {
       double diff = (vrzLow_15m - bid) / GetPipDivisor();
-      int diffPts = (int)MathRound(diff);
-      string sign = (diffPts >= 0) ? "+" : "";
-      vrzLowStr = "  VRZ Low: " + DoubleToString(vrzLow_15m, _Digits) + " (" + sign + (string)diffPts + ")";
+      string sign = (diff >= 0) ? "+" : "";
+      htfVrzLowStr = "  VRZ Low: " + DoubleToString(vrzLow_15m, _Digits) + " (" + sign + DoubleToString(diff, 1) + ")";
      }
-   CreateHUDText("AK10X_HUD_HtfVrzLow", vrzLowStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
-   
+   CreateHUDText("AK10X_HUD_HtfVrzLow", htfVrzLowStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
    line++; // spacer
    
-   // Header for Lower Time Frame
+   // --- Section 2: TRADING TIME FRAME ---
    string ltfStr = EnumToString(TradingPeriod);
-   CreateHUDText("AK10X_HUD_LtfHeader", "LOWER TIME FRAME (" + ltfStr + ")", xStart, yStart + (line++ * ySpacing), 8, true, clrSilver);
+   CreateHUDText("AK10X_HUD_LtfHeader", "TRADING TIME FRAME (" + ltfStr + ")", xStart, yStart + (line++ * ySpacing), 8, true, clrSilver);
    
-   // 1. LTF Trend state
-   string ltfTrendStr = "  Trend: " + CleanTrendString(ttf_Trend);
+   string ltfTrendStr = "  TREND: " + CleanTrendString(ttf_Trend);
    color ltfTrendColor = GetTrendColor(ttf_Trend);
    CreateHUDText("AK10X_HUD_LtfTrend", ltfTrendStr, xStart, yStart + (line++ * ySpacing), 8, true, ltfTrendColor);
    
-   // 2. LTF Swing High
    string ltfSwingHighStr = "  Swing High: N/A";
    if(minor_SwingHighPrice > 0)
      {
       double diff = (minor_SwingHighPrice - bid) / GetPipDivisor();
-      int diffPts = (int)MathRound(diff);
-      string sign = (diffPts >= 0) ? "+" : "";
-      ltfSwingHighStr = "  Swing High: " + DoubleToString(minor_SwingHighPrice, _Digits) + " (" + sign + (string)diffPts + ")";
+      string sign = (diff >= 0) ? "+" : "";
+      ltfSwingHighStr = "  Swing High: " + DoubleToString(minor_SwingHighPrice, _Digits) + " (" + sign + DoubleToString(diff, 1) + ")";
      }
    CreateHUDText("AK10X_HUD_LtfSwingHigh", ltfSwingHighStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
    
-   // 3. LTF Swing Low
    string ltfSwingLowStr = "  Swing Low: N/A";
    if(minor_SwingLowPrice > 0)
      {
       double diff = (minor_SwingLowPrice - bid) / GetPipDivisor();
-      int diffPts = (int)MathRound(diff);
-      string sign = (diffPts >= 0) ? "+" : "";
-      ltfSwingLowStr = "  Swing Low: " + DoubleToString(minor_SwingLowPrice, _Digits) + " (" + sign + (string)diffPts + ")";
+      string sign = (diff >= 0) ? "+" : "";
+      ltfSwingLowStr = "  Swing Low: " + DoubleToString(minor_SwingLowPrice, _Digits) + " (" + sign + DoubleToString(diff, 1) + ")";
      }
    CreateHUDText("AK10X_HUD_LtfSwingLow", ltfSwingLowStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text);
-    
-   line++; // spacer (some space after lower time frame)
+   line++; // spacer
    
-   // Delete previous news labels to avoid ghosting
-   ObjectsDeleteAll(0, "AK10X_HUD_News");
+   // --- Section 3: LOGICAL THINKER SYSTEM (MENTOR) ---
+   CreateHUDText("AK10X_HUD_MentorHeader", "LOGICAL THINKER SYSTEM (MENTOR)", xStart, yStart + (line++ * ySpacing), 8, true, clrSilver);
    
-   // Header for News
+   string boStr = "N/A";
+   color boColor = clrGray;
+   if(currentBreakout.isValid)
+     {
+      string pStr = DoubleToString(currentBreakout.levelPrice, _Digits);
+      if(currentBreakout.levelType == "VRZ High")
+        {
+         boStr = "VRZ High (" + pStr + ")";
+         boColor = clrMediumSpringGreen;
+        }
+      else
+        {
+         boStr = "VRZ Low (" + pStr + ")";
+         boColor = clrTomato;
+        }
+     }
+   CreateHUDText("AK10X_HUD_BOVal", "  Breakout: " + boStr, xStart, yStart + (line++ * ySpacing), 8, true, boColor);
+   
+   bool hasActive = currentBreakout.isValid;
+   string r1_text = (hasActive) ? "  ✔ Rule 1 - Context" : "  [ ] Rule 1 - Context";
+   color r1_color = (hasActive) ? clrMediumSpringGreen : clrGray;
+   CreateHUDText("AK10X_HUD_R1", r1_text, xStart, yStart + (line++ * ySpacing), 8, false, r1_color);
+   
+   string r2_text = "  [ ] Rule 2 - Reaction";
+   color r2_color = clrGray;
+   if(hasActive)
+     {
+      if(currentBreakout.reaction == "Continuation" || currentBreakout.reaction == "Immediate Reversal")
+        {
+         r2_text = "  ✔ Rule 2 - Reaction";
+         r2_color = clrMediumSpringGreen;
+        }
+      else if(currentBreakout.reaction == "Direct Breakout")
+        {
+         r2_text = "  ✘ Rule 2 - Reaction (Direct)";
+         r2_color = clrTomato;
+        }
+     }
+   CreateHUDText("AK10X_HUD_R2", r2_text, xStart, yStart + (line++ * ySpacing), 8, false, r2_color);
+   
+   string r3_text = "  [ ] Rule 3 - Validation";
+   color r3_color = clrGray;
+   if(hasActive)
+     {
+      if(currentBreakout.status == "Pending Order" || currentBreakout.status == "Running Order")
+        {
+         r3_text = "  ✔ Rule 3 - Validation";
+         r3_color = clrMediumSpringGreen;
+        }
+      else if(currentBreakout.status == "Failed Validation")
+        {
+         r3_text = "  ✘ Rule 3 - Validation";
+         r3_color = clrTomato;
+        }
+     }
+   CreateHUDText("AK10X_HUD_R3", r3_text, xStart, yStart + (line++ * ySpacing), 8, false, r3_color);
+   
+   string setupName = "N/A";
+   string grade = "N/A";
+   string rrStr = "N/A";
+   
+   bool isTradePassed = (hasActive && (currentBreakout.status == "Pending Order" || currentBreakout.status == "Running Order"));
+   
+   if(isTradePassed && currentBreakout.setup != SETUP_NONE)
+     {
+      setupName = EnumToString(currentBreakout.setup);
+      StringReplace(setupName, "SETUP_", "");
+      
+      if(currentBreakout.setup == SETUP_BOL || currentBreakout.setup == SETUP_BOFL)
+        {
+         ENUM_TREND htf = GetHTFTrend();
+         ENUM_TREND ttf = ttf_Trend;
+         if(htf == TREND_UP && ttf == TREND_UP) { grade = "A+++"; }
+         else { grade = "A++"; }
+        }
+      else
+        {
+         ENUM_TREND htf = GetHTFTrend();
+         ENUM_TREND ttf = ttf_Trend;
+         if(htf == TREND_DOWN && ttf == TREND_DOWN) { grade = "A+++"; }
+         else { grade = "A++"; }
+        }
+        
+      double entry = currentBreakout.levelPrice;
+      double sl = currentBreakout.sl;
+      double tp = currentBreakout.tp;
+      double risk = MathAbs(entry - sl);
+      double reward = MathAbs(tp - entry);
+      if(risk > 0)
+        {
+         rrStr = "1 : " + DoubleToString(reward / risk, 1);
+        }
+     }
+     
+   line++; // spacer
+   CreateHUDText("AK10X_HUD_SetupVal", "  Setup           : " + setupName, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   CreateHUDText("AK10X_HUD_GradeVal", "  Grade           : " + grade, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   CreateHUDText("AK10X_HUD_RRVal",    "  Risk Reward     : " + rrStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   
+   string statusStr = "N/A";
+   string lotStr = "N/A";
+   string entryPriceStr = "N/A";
+   string slPriceStr = "N/A";
+   string tpPriceStr = "N/A";
+   string rfStr = "N/A";
+   
+   if(hasActive)
+     {
+      statusStr = currentBreakout.status;
+      if(statusStr == "") statusStr = "N/A";
+      
+      if(isTradePassed)
+        {
+         lotStr = DoubleToString(currentBreakout.currentLot, 2);
+         entryPriceStr = DoubleToString(currentBreakout.levelPrice, _Digits);
+         slPriceStr = DoubleToString(currentBreakout.sl, _Digits);
+         tpPriceStr = DoubleToString(currentBreakout.tp, _Digits);
+         
+         if(statusStr == "Running Order")
+           {
+            rfStr = currentBreakout.riskFreeDone ? "Done" : "Waiting";
+           }
+         else if(statusStr == "Pending Order")
+           {
+            rfStr = "Waiting";
+           }
+        }
+     }
+   CreateHUDText("AK10X_HUD_StatVal",  "  Status          : " + statusStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   CreateHUDText("AK10X_HUD_EntryVal", "  Entry Price     : " + entryPriceStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   CreateHUDText("AK10X_HUD_SLVal",    "  Stop Loss       : " + slPriceStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   CreateHUDText("AK10X_HUD_TPVal",    "  Take Profit     : " + tpPriceStr, xStart, yStart + (line++ * ySpacing), 8, false, ColorHUD_Text, "Consolas");
+   
+   color rfColor = ColorHUD_Text;
+   if(rfStr == "Done") rfColor = clrMediumSpringGreen;
+   else if(rfStr == "Waiting") rfColor = clrYellow;
+   CreateHUDText("AK10X_HUD_RFVal",    "  Risk-Free       : " + rfStr, xStart, yStart + (line++ * ySpacing), 8, false, rfColor, "Consolas");
+   line++; // spacer
+   
+   // --- Section 4: NEWS FILTER STATUS ---
    CreateHUDText("AK10X_HUD_NewsHeader", "NEWS FILTER STATUS", xStart, yStart + (line++ * ySpacing), 8, true, clrSilver);
    
    NewsEventInfo newsInfoList[];
@@ -2222,17 +3267,6 @@ void UpdateHUD()
                   impactColor = clrSilver;
                  }
               }
-            else
-              {
-               // Print debug info to experts journal at most once every 30 seconds
-               static datetime lastPrint = 0;
-               if(TimeCurrent() - lastPrint >= 30)
-                 {
-                  PrintFormat("AK10XPro Debug: Event '%s' (%s) time has passed by %d sec, but terminal calendar value is still LONG_MIN (Pending). ServerTime: %s, EventTime: %s", 
-                              newsInfo.name, newsInfo.currency, (int)(TimeCurrent() - newsInfo.eventTime), TimeToString(TimeCurrent()), TimeToString(newsInfo.eventTime));
-                  lastPrint = TimeCurrent();
-                 }
-              }
             CreateHUDText("AK10X_HUD_NewsImpact_" + idxStr, impactLine, xStart, yStart + (line++ * ySpacing), 8, true, impactColor);
            }
         }
@@ -2266,25 +3300,44 @@ void UpdateHUD()
    int finalHeight = (btnY + btnHeight + 12) - (yStart - 10);
    ObjectSetInteger(0, "AK10X_HUD_Bg", OBJPROP_YSIZE, finalHeight);
    
+   DeleteUnusedHUDObjects();
    ChartRedraw(0);
   }
 
 //+------------------------------------------------------------------+
 //| Create UI Text helper                                            |
 //+------------------------------------------------------------------+
-void CreateHUDText(string name, string text, int x, int y, int size, bool bold, color textClr)
+void CreateHUDText(string name, string text, int x, int y, int size, bool bold, color textClr, string fontName = "")
   {
+   RegisterDrawnHUD(name);
+   string actualFont = fontName;
+   if(actualFont == "")
+      actualFont = bold ? "Trebuchet MS" : "Arial";
+      
    if(ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
      {
       ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
       ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
       ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetString(0, name, OBJPROP_TEXT, text);
-      ObjectSetString(0, name, OBJPROP_FONT, bold ? "Trebuchet MS" : "Arial");
+      ObjectSetString(0, name, OBJPROP_FONT, actualFont);
       ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
       ObjectSetInteger(0, name, OBJPROP_COLOR, textClr);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 101);
+     }
+   else
+     {
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, textClr);
+      ObjectSetString(0, name, OBJPROP_FONT, actualFont);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 101);
      }
   }
 
@@ -2293,6 +3346,7 @@ void CreateHUDText(string name, string text, int x, int y, int size, bool bold, 
 //+------------------------------------------------------------------+
 void CreateHUDPanel(string name, int x, int y, int w, int h, color bgClr, int border)
   {
+   RegisterDrawnHUD(name);
    if(ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0))
      {
       ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
@@ -2306,6 +3360,18 @@ void CreateHUDPanel(string name, int x, int y, int w, int h, color bgClr, int bo
       ObjectSetInteger(0, name, OBJPROP_WIDTH, border);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 100);
+     }
+   else
+     {
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgClr);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 100);
      }
   }
 
@@ -2314,6 +3380,7 @@ void CreateHUDPanel(string name, int x, int y, int w, int h, color bgClr, int bo
 //+------------------------------------------------------------------+
 void CreateHUDButton(string name, string text, int x, int y, int w, int h, color bgClr, color textClr)
   {
+   RegisterDrawnHUD(name);
    if(ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
      {
       ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
@@ -2329,6 +3396,20 @@ void CreateHUDButton(string name, string text, int x, int y, int w, int h, color
       ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrDarkGray);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 101);
+     }
+   else
+     {
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, textClr);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bgClr);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER, 101);
      }
   }
 
@@ -2353,7 +3434,7 @@ void UpdateCountdown()
    int seconds = remainingSeconds % 60;
    string countdownStr = StringFormat("%02d:%02d", minutes, seconds);
    
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bid = GetLatestBid();
    int x_pixel = 0;
    int y_pixel = 0;
    
@@ -2430,3 +3511,9 @@ void UpdateCountdown()
    ObjectSetInteger(0, objName, OBJPROP_BORDER_COLOR, bidColor);
    ObjectSetString(0, objName, OBJPROP_TEXT, countdownStr);
   }
+
+//+------------------------------------------------------------------+
+//| Track breakouts in real-time on every tick                        |
+//+------------------------------------------------------------------+
+
+
